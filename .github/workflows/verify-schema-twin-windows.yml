@@ -296,13 +296,11 @@ jobs:
         shell: python
         run: |
           import hashlib
-          import io
           import json
           import os
           from pathlib import Path
           import re
           import subprocess
-          import tarfile
           
           TEST = 'packages/core-internal/test/wire/schemaTwinConformance.test.ts'
           CORPUS = 'packages/core-internal/test/corpus'
@@ -331,19 +329,21 @@ jobs:
                   return subprocess.check_output(['git', *args], cwd=source, timeout=60)
               assert git('rev-parse', 'HEAD').decode().strip() == sha
               paths = [TEST, f'{CORPUS}/fixtures', f'{CORPUS}/schema-twins']
-              archive = git('archive', '--format=tar', sha, *paths)
+              entries = git('ls-tree', '-r', '-z', sha, '--', *paths)
               records = {}
-              with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
-                  for member in tar:
-                      if member.isdir():
-                          continue
-                      assert member.isfile() and '..' not in Path(member.name).parts
-                      assert member.name == TEST or member.name.startswith(f'{CORPUS}/fixtures/') or member.name.startswith(f'{CORPUS}/schema-twins/')
-                      data = tar.extractfile(member).read()
-                      target = harness / member.name.removeprefix('packages/core-internal/')
-                      target.parent.mkdir(parents=True, exist_ok=True)
-                      target.write_bytes(data)
-                      records[member.name] = {'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
+              for entry in entries.split(b'\0'):
+                  if not entry:
+                      continue
+                  metadata, name = entry.decode().split('\t', 1)
+                  mode, kind, oid = metadata.split()
+                  assert kind == 'blob' and mode in ('100644', '100755') and '..' not in Path(name).parts
+                  assert name == TEST or name.startswith(f'{CORPUS}/fixtures/') or name.startswith(f'{CORPUS}/schema-twins/')
+                  data = git('cat-file', 'blob', oid)
+                  assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == oid
+                  target = harness / name.removeprefix('packages/core-internal/')
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  target.write_bytes(data)
+                  records[name] = {'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest(), 'git_blob': oid}
               assert records[TEST]['sha256'] == os.environ['EXPECTED_TEST_SHA256'], records[TEST]
               lock = git('show', f'{sha}:pnpm-lock.yaml').decode()
               package = {'name': 'schema-twin-windows-check', 'private': True, 'type': 'module',
