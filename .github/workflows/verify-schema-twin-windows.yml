@@ -45,7 +45,7 @@ jobs:
           )
           $details | Tee-Object -FilePath (Join-Path $evidence 'environment.log')
           if (-not $IsWindows) { throw 'Native Windows is required' }
-      - name: Verify old and fresh Windows checkouts
+      - name: Verify stable-stat old and fresh Windows checkouts
         shell: python
         run: |
           import contextlib
@@ -138,6 +138,11 @@ jobs:
               assert unchanged['ordinary.txt'] == ordinary.replace(b'\n', b'\r\n')
               assert git(existing, 'status', '--porcelain') == ''
           
+              # Model a long-lived, non-racy checkout deterministically, without a sleep.
+              for path in SCHEMAS:
+                  os.utime(existing / path, (946684800, 946684800))
+              git(existing, 'update-index', '--refresh', '--', *SCHEMAS)
+              assert git(existing, 'status', '--porcelain') == ''
               (origin / '.gitattributes').write_bytes(blobs['.gitattributes'])
               git(origin, '-c', 'core.autocrlf=false', 'add', '.gitattributes')
               git(origin, 'commit', '-m', 'Local fixture with exact PR attribute')
@@ -148,7 +153,12 @@ jobs:
               index_before = git(existing, 'ls-files', '--stage', raw=True)
               tree_before = git(existing, 'write-tree')
           
-              # Run the exact recovery command through native PowerShell, with explicit paths.
+              git(existing, 'ls-files', '--debug', '--', *SCHEMAS)
+              print('STAT_BEFORE: ' + json.dumps({path: {'size': (existing / path).stat().st_size,
+                    'mtime_ns': (existing / path).stat().st_mtime_ns} for path in SCHEMAS}))
+              print('INDEX_MTIME_NS=' + str((existing / '.git/index').stat().st_mtime_ns))
+              # RED: --force does not bypass a matching index stat cache.
+          
               recovery = '& git checkout-index --force --index -- ' + ' '.join('"' + path + '"' for path in SCHEMAS)
               recovery += '; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }'
               print('POWERSHELL RECOVERY: ' + recovery)
@@ -156,7 +166,33 @@ jobs:
                                       cwd=existing, env=env, capture_output=True, text=True, timeout=60)
               print(f'PowerShell recovery exit={result.returncode}\n{result.stdout}{result.stderr}')
               result.check_returncode()
-              recovered = check(existing, 'After checkout-index recovery', False)
+              legacy = check(existing, 'After old force command: unchanged CRLF bytes', True)
+              assert legacy == after_pull
+              assert git(existing, 'ls-files', '--stage', raw=True) == index_before
+              assert git(existing, 'write-tree') == tree_before
+              git(existing, 'ls-files', '--debug', '--', *SCHEMAS)
+              print('STAT_AFTER_OLD: ' + json.dumps({path: {'size': (existing / path).stat().st_size,
+                    'mtime_ns': (existing / path).stat().st_mtime_ns} for path in SCHEMAS}))
+              print('RED reproduced: old command exits zero but leaves both CRLF files unchanged')
+          
+              # GREEN: move only the targets out of the worktree, retaining their exact bytes.
+              backup = scratch / 'schema backups'
+              backup.mkdir()
+              backed_up = {path: (existing / path).read_bytes() for path in SCHEMAS}
+              for path in SCHEMAS:
+                  destination = backup / Path(path).name
+                  assert not destination.exists()
+                  shutil.move(str(existing / path), str(destination))
+                  assert not (existing / path).exists()
+              recovery = recovery.replace('--force ', '')
+              print('POWERSHELL RECOVERY AFTER BACKUP: ' + recovery)
+              result = subprocess.run([pwsh_exe, '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', recovery],
+                                      cwd=existing, env=env, capture_output=True, text=True, timeout=60)
+              print(f'PowerShell recovery exit={result.returncode}\n{result.stdout}{result.stderr}')
+              result.check_returncode()
+              recovered = check(existing, 'After move-to-backup and checkout-index --index', False)
+              for path, data in backed_up.items():
+                  assert (backup / Path(path).name).read_bytes() == data
               assert git(existing, 'ls-files', '--stage', raw=True) == index_before
               assert git(existing, 'write-tree') == tree_before
               assert git(existing, 'status', '--porcelain') == ''
@@ -174,10 +210,46 @@ jobs:
               assert git(fresh, 'status', '--porcelain') == ''
               for path, data in unchanged.items():
                   assert (fresh / path).read_bytes() == data
+              # Separate safety case: recreate INDEX content, retaining intentional unstaged edits in backups.
+              staged = b'{"preserve":"staged target"}\n'
+              unstaged = b'{"preserve":"unstaged target"}\n'
+              (existing / SCHEMAS[0]).write_bytes(staged)
+              git(existing, 'add', '--', SCHEMAS[0])
+              (existing / SCHEMAS[0]).write_bytes(unstaged)
+              (existing / 'ordinary.txt').write_bytes(b'keep staged unrelated\r\n')
+              git(existing, 'add', '--', 'ordinary.txt')
+              (existing / 'ordinary.txt').write_bytes(b'keep unstaged unrelated\r\n')
+              staged_index = git(existing, 'ls-files', '--stage', raw=True)
+              staged_tree = git(existing, 'write-tree')
+              other_paths = [MANIFEST, 'ordinary.txt', '.gitattributes']
+              others_before = {path: (existing / path).read_bytes() for path in other_paths}
+              staged_backups = {path: (existing / path).read_bytes() for path in SCHEMAS}
+              backup2 = scratch / 'intentional edit backups'
+              backup2.mkdir()
+              for path in SCHEMAS:
+                  destination = backup2 / Path(path).name
+                  assert not destination.exists()
+                  shutil.move(str(existing / path), str(destination))
+                  assert not (existing / path).exists()
+              result = subprocess.run([pwsh_exe, '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', recovery],
+                                      cwd=existing, env=env, capture_output=True, text=True, timeout=60)
+              result.check_returncode()
+              assert (existing / SCHEMAS[0]).read_bytes() == staged
+              assert (existing / SCHEMAS[1]).read_bytes() == blobs[SCHEMAS[1]]
+              assert git(existing, 'ls-files', '--stage', raw=True) == staged_index
+              assert git(existing, 'write-tree') == staged_tree
+              for path, data in staged_backups.items():
+                  assert (backup2 / Path(path).name).read_bytes() == data
+              for path, data in others_before.items():
+                  assert (existing / path).read_bytes() == data
+              print('PASS safety case: staged target restored from INDEX; unstaged target preserved in backup; unrelated staged/unstaged data unchanged')
               return {'result': 'PASS', 'native_windows': True, 'platform': platform.platform(), 'git_version': version,
                       'source_commit': SOURCE_SHA, 'source_bytes': source_result, 'existing_before': before,
-                      'after_attribute_only_pull': after_pull, 'after_recovery': recovered, 'fresh_clone': fresh_result,
-                      'index_content_unchanged': True, 'worktree_clean': True, 'other_text_preserved': True,
+                      'after_attribute_only_pull': after_pull, 'after_old_force_command': legacy, 'after_recovery': recovered, 'fresh_clone': fresh_result,
+                      'index_content_unchanged': True, 'normal_recovery_worktree_clean': True, 'other_text_preserved': True,
+                      'original_crlf_backups_preserved': True,
+                      'intentional_edits_case': {'index_content_unchanged': True, 'staged_target_restored': True,
+                                                 'unstaged_target_backed_up': True, 'unrelated_staged_and_unstaged_preserved': True},
                       'scope': 'Focused Git checkout and byte/SHA checks only; complete-file Vitest results are reported separately.'}
           
           
