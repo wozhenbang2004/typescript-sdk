@@ -1,0 +1,217 @@
+name: Schema twin Windows verification
+
+on:
+  push:
+    branches: [verify-schema-twin-windows-3120]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    if: github.repository == 'wozhenbang2004/typescript-sdk'
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Read exact PR head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: wozhenbang2004/typescript-sdk
+          ref: 50b8ccfc268f7d1fb9e0d015efd3f254b2ff586d
+          path: source
+          persist-credentials: false
+          clean: false
+          fetch-depth: 1
+      - name: Record native Windows environment
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $evidence = Join-Path $env:RUNNER_TEMP 'schema-twin-evidence'
+          New-Item -ItemType Directory -Force -Path $evidence | Out-Null
+          $details = @(
+            "UTC=$([DateTime]::UtcNow.ToString('o'))"
+            "OS=$([Environment]::OSVersion.VersionString)"
+            "PowerShell=$($PSVersionTable.PSVersion)"
+            "GitExecutable=$((Get-Command git -ErrorAction Stop).Source)"
+            "GitVersion=$(git --version)"
+            "PythonExecutable=$((Get-Command python -ErrorAction Stop).Source)"
+            "PythonVersion=$(python --version)"
+            "WorkflowCommit=$env:GITHUB_SHA"
+            "RunnerImage=$env:ImageOS $env:ImageVersion"
+          )
+          $details | Tee-Object -FilePath (Join-Path $evidence 'environment.log')
+          if (-not $IsWindows) { throw 'Native Windows is required' }
+      - name: Verify old and fresh Windows checkouts
+        shell: python
+        run: |
+          import contextlib
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import platform
+          import shutil
+          import subprocess
+          import sys
+          import tempfile
+          import traceback
+          
+          SOURCE_SHA = '50b8ccfc268f7d1fb9e0d015efd3f254b2ff586d'
+          TWINS = 'packages/core-internal/test/corpus/schema-twins'
+          REVISIONS = ('2025-11-25', '2026-07-28')
+          SCHEMAS = [f'{TWINS}/{revision}.schema.json' for revision in REVISIONS]
+          MANIFEST = f'{TWINS}/manifest.json'
+          
+          
+          def verify():
+              assert os.name == 'nt' and platform.system() == 'Windows', 'Native Windows is required'
+              source = Path(os.environ['GITHUB_WORKSPACE']) / 'source'
+              scratch = Path(tempfile.mkdtemp(prefix='schema twin windows ', dir=os.environ['RUNNER_TEMP']))
+              empty = scratch / 'empty'
+              empty.mkdir()
+              config = scratch / 'empty.gitconfig'
+              config.write_bytes(b'')
+              env = dict(os.environ, GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=str(config), GIT_TERMINAL_PROMPT='0')
+              git_exe = shutil.which('git')
+              pwsh_exe = shutil.which('pwsh')
+              assert git_exe and pwsh_exe
+          
+              def git(cwd, *args, raw=False):
+                  cmd = [git_exe, '-c', f'core.hooksPath={empty}', '-c', f'core.attributesFile={config}', *args]
+                  print(f'git cwd={cwd} args={json.dumps(args)}')
+                  result = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, timeout=60)
+                  if result.stderr:
+                      print(result.stderr.decode('utf-8', errors='replace').strip())
+                  if not raw and result.stdout:
+                      print(result.stdout.decode('utf-8', errors='replace').strip())
+                  result.check_returncode()
+                  return result.stdout if raw else result.stdout.decode('utf-8').strip()
+          
+              version = git(source, '--version')
+              assert '.windows.' in version, f'Expected Git for Windows, got {version}'
+              assert git(source, 'rev-parse', 'HEAD') == SOURCE_SHA
+              print(f'PLATFORM={platform.platform()} GIT={git_exe} PWSH={pwsh_exe}')
+              print(f'SOURCE=https://github.com/wozhenbang2004/typescript-sdk/tree/{SOURCE_SHA}')
+              blobs = {path: git(source, 'show', f'{SOURCE_SHA}:{path}', raw=True) for path in [*SCHEMAS, MANIFEST, '.gitattributes']}
+              assert blobs['.gitattributes'] == (b'# Preserve the upstream bytes pinned by the schema-twin provenance manifest.\n'
+                                              b'packages/core-internal/test/corpus/schema-twins/*.schema.json -text\n')
+              manifest = json.loads(blobs[MANIFEST])
+              assert set(manifest['files']) == set(REVISIONS)
+          
+              def check(directory, label, crlf):
+                  result = {}
+                  for revision, path in zip(REVISIONS, SCHEMAS):
+                      data = (directory / path).read_bytes()
+                      entry = manifest['files'][revision]
+                      digest = hashlib.sha256(data).hexdigest()
+                      matches = len(data) == entry['bytes'] and digest == entry['sha256']
+                      assert data == (blobs[path].replace(b'\n', b'\r\n') if crlf else blobs[path])
+                      assert matches is (not crlf)
+                      result[revision] = {'bytes': len(data), 'sha256': digest, 'matches_manifest': matches}
+                  print(label + ': ' + json.dumps(result, sort_keys=True))
+                  return result
+          
+              origin, existing, fresh = (scratch / name for name in ('origin', 'existing clone', 'fresh clone'))
+              origin.mkdir()
+              for path in [*SCHEMAS, MANIFEST]:
+                  target = origin / path
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  target.write_bytes(blobs[path])
+              ordinary = b'unrelated\ntext\n'
+              (origin / 'ordinary.txt').write_bytes(ordinary)
+              source_result = check(origin, 'Exact source bytes', False)
+              git(origin, 'init', '-b', 'main', f'--template={empty}')
+              git(origin, 'config', 'user.name', 'Schema twin verification')
+              git(origin, 'config', 'user.email', 'verification@example.invalid')
+              git(origin, '-c', 'core.autocrlf=false', 'add', '.')
+              git(origin, 'commit', '-m', 'Local fixture before attribute')
+              baseline = git(origin, 'rev-parse', 'HEAD')
+              git(scratch, 'clone', '--local', '--no-hardlinks', '-c', 'core.autocrlf=true', str(origin), str(existing))
+              assert git(existing, 'config', '--get', 'core.autocrlf') == 'true'
+              before = check(existing, 'Existing clone before attribute', True)
+              unchanged = {path: (existing / path).read_bytes() for path in [MANIFEST, 'ordinary.txt']}
+              assert unchanged[MANIFEST] == blobs[MANIFEST].replace(b'\n', b'\r\n')
+              assert unchanged['ordinary.txt'] == ordinary.replace(b'\n', b'\r\n')
+              assert git(existing, 'status', '--porcelain') == ''
+          
+              (origin / '.gitattributes').write_bytes(blobs['.gitattributes'])
+              git(origin, '-c', 'core.autocrlf=false', 'add', '.gitattributes')
+              git(origin, 'commit', '-m', 'Local fixture with exact PR attribute')
+              assert git(origin, 'diff', '--name-only', baseline, 'HEAD') == '.gitattributes'
+              git(existing, 'pull', '--ff-only')
+              after_pull = check(existing, 'After attribute-only pull', True)
+              assert before == after_pull
+              index_before = git(existing, 'ls-files', '--stage', raw=True)
+              tree_before = git(existing, 'write-tree')
+          
+              # Run the exact recovery command through native PowerShell, with explicit paths.
+              recovery = '& git checkout-index --force --index -- ' + ' '.join('"' + path + '"' for path in SCHEMAS)
+              recovery += '; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }'
+              print('POWERSHELL RECOVERY: ' + recovery)
+              result = subprocess.run([pwsh_exe, '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', recovery],
+                                      cwd=existing, env=env, capture_output=True, text=True, timeout=60)
+              print(f'PowerShell recovery exit={result.returncode}\n{result.stdout}{result.stderr}')
+              result.check_returncode()
+              recovered = check(existing, 'After checkout-index recovery', False)
+              assert git(existing, 'ls-files', '--stage', raw=True) == index_before
+              assert git(existing, 'write-tree') == tree_before
+              assert git(existing, 'status', '--porcelain') == ''
+              git(existing, 'diff', '--cached', '--check')
+              for path, data in unchanged.items():
+                  assert (existing / path).read_bytes() == data
+              attrs = git(existing, 'check-attr', 'text', '--', *SCHEMAS, MANIFEST)
+              for path in SCHEMAS:
+                  assert f'{path}: text: unset' in attrs
+              assert f'{MANIFEST}: text: unspecified' in attrs
+              print('PASS: index content unchanged; worktree clean; manifest and unrelated text unchanged and CRLF')
+          
+              git(scratch, 'clone', '--local', '--no-hardlinks', '-c', 'core.autocrlf=true', str(origin), str(fresh))
+              fresh_result = check(fresh, 'Fresh clone with attribute', False)
+              assert git(fresh, 'status', '--porcelain') == ''
+              for path, data in unchanged.items():
+                  assert (fresh / path).read_bytes() == data
+              return {'result': 'PASS', 'native_windows': True, 'platform': platform.platform(), 'git_version': version,
+                      'source_commit': SOURCE_SHA, 'source_bytes': source_result, 'existing_before': before,
+                      'after_attribute_only_pull': after_pull, 'after_recovery': recovered, 'fresh_clone': fresh_result,
+                      'index_content_unchanged': True, 'worktree_clean': True, 'other_text_preserved': True,
+                      'scope': 'Focused Git checkout and byte/SHA checks only; no Vitest, package build, or full lint run.'}
+          
+          
+          class Tee:
+              def __init__(self, output, logfile):
+                  self.output, self.logfile = output, logfile
+          
+              def write(self, text):
+                  self.output.write(text)
+                  self.logfile.write(text)
+                  self.flush()
+          
+              def flush(self):
+                  self.output.flush()
+                  self.logfile.flush()
+          
+          
+          if __name__ == '__main__':
+              evidence = Path(os.environ['RUNNER_TEMP']) / 'schema-twin-evidence'
+              evidence.mkdir(exist_ok=True)
+              summary = {'result': 'FAIL', 'native_windows': os.name == 'nt', 'source_commit': SOURCE_SHA}
+              with (evidence / 'verification.log').open('w', encoding='utf-8', newline='\n') as logfile:
+                  with contextlib.redirect_stdout(Tee(sys.stdout, logfile)), contextlib.redirect_stderr(Tee(sys.stderr, logfile)):
+                      try:
+                          summary = verify()
+                          print('PASS: native Windows schema-twin checkout verification')
+                      except Exception:
+                          traceback.print_exc()
+              (evidence / 'result.json').write_text(json.dumps(summary, indent=2) + '\n', encoding='utf-8')
+              with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as output:
+                  output.write(f"## Schema-twin Windows verification: {summary['result']}\n\nSource: `{SOURCE_SHA}`\n\n")
+                  output.write('See the uploaded verification log and result.json. This is a focused checkout test, not the full SDK test suite.\n')
+              sys.exit(0 if summary['result'] == 'PASS' else 1)
+      - name: Upload real verification evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: schema-twin-windows-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/schema-twin-evidence/
+          if-no-files-found: error
+          retention-days: 7
