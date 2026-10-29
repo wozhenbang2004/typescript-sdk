@@ -7,6 +7,10 @@ on:
 permissions:
   contents: read
 
+env:
+  SOURCE_SHA: 0e2bb6d60a0da7089e2deb34d4d022588a0b3926
+  EXPECTED_TEST_SHA256: 6d11516b9c104bd4dc447176c5cbc9f919fc60bb4537afdc2cf8ca18b63ea5cc
+
 jobs:
   verify:
     if: github.repository == 'wozhenbang2004/typescript-sdk'
@@ -17,7 +21,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: wozhenbang2004/typescript-sdk
-          ref: 50b8ccfc268f7d1fb9e0d015efd3f254b2ff586d
+          ref: ${{ env.SOURCE_SHA }}
           path: source
           persist-credentials: false
           clean: false
@@ -56,7 +60,7 @@ jobs:
           import tempfile
           import traceback
           
-          SOURCE_SHA = '50b8ccfc268f7d1fb9e0d015efd3f254b2ff586d'
+          SOURCE_SHA = os.environ['SOURCE_SHA']
           TWINS = 'packages/core-internal/test/corpus/schema-twins'
           REVISIONS = ('2025-11-25', '2026-07-28')
           SCHEMAS = [f'{TWINS}/{revision}.schema.json' for revision in REVISIONS]
@@ -174,7 +178,7 @@ jobs:
                       'source_commit': SOURCE_SHA, 'source_bytes': source_result, 'existing_before': before,
                       'after_attribute_only_pull': after_pull, 'after_recovery': recovered, 'fresh_clone': fresh_result,
                       'index_content_unchanged': True, 'worktree_clean': True, 'other_text_preserved': True,
-                      'scope': 'Focused Git checkout and byte/SHA checks only; no Vitest, package build, or full lint run.'}
+                      'scope': 'Focused Git checkout and byte/SHA checks only; complete-file Vitest results are reported separately.'}
           
           
           class Tee:
@@ -207,6 +211,114 @@ jobs:
                   output.write(f"## Schema-twin Windows verification: {summary['result']}\n\nSource: `{SOURCE_SHA}`\n\n")
                   output.write('See the uploaded verification log and result.json. This is a focused checkout test, not the full SDK test suite.\n')
               sys.exit(0 if summary['result'] == 'PASS' else 1)
+      - name: Set up Node 24
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+      - name: Set up source-pinned pnpm
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5.0.0
+        with:
+          version: 10.26.1
+          run_install: false
+      - name: Materialize unchanged complete test and corpus
+        shell: python
+        run: |
+          import hashlib
+          import io
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import tarfile
+          
+          TEST = 'packages/core-internal/test/wire/schemaTwinConformance.test.ts'
+          CORPUS = 'packages/core-internal/test/corpus'
+          VERSIONS = {'vitest': '4.1.2', 'ajv': '8.18.0', 'ajv-formats': '3.0.1'}
+          
+          
+          def isolated_lock(lock):
+              importer = lock.split('\n  packages/core-internal:\n', 1)[1].split('\n  packages/', 1)[0]
+              root = '\nimporters:\n\n  .:\n    devDependencies:\n'
+              for name, version in VERSIONS.items():
+                  match = re.search(rf'^      {re.escape(name)}:\n        specifier: [^\n]+\n        version: ([^\n]+)$', importer, re.M)
+                  assert match and match[1].split('(')[0] == version, (name, match)
+                  root += f'      {name}:\n        specifier: {version}\n        version: {match[1]}\n'
+              # Preserve the source lock's package integrity hashes and peer-resolved snapshots.
+              return lock.split('\ncatalogs:', 1)[0] + root + '\npackages:' + lock.split('\npackages:', 1)[1]
+          
+          
+          def main():
+              assert os.name == 'nt', 'Native Windows is required'
+              source = Path(os.environ['GITHUB_WORKSPACE']) / 'source'
+              sha = os.environ['SOURCE_SHA']
+              harness = Path(os.environ['RUNNER_TEMP']) / 'schema-twin-full-test'
+              evidence = Path(os.environ['RUNNER_TEMP']) / 'schema-twin-evidence'
+              harness.mkdir()
+              def git(*args):
+                  return subprocess.check_output(['git', *args], cwd=source, timeout=60)
+              assert git('rev-parse', 'HEAD').decode().strip() == sha
+              paths = [TEST, f'{CORPUS}/fixtures', f'{CORPUS}/schema-twins']
+              archive = git('archive', '--format=tar', sha, *paths)
+              records = {}
+              with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+                  for member in tar:
+                      if member.isdir():
+                          continue
+                      assert member.isfile() and '..' not in Path(member.name).parts
+                      assert member.name == TEST or member.name.startswith(f'{CORPUS}/fixtures/') or member.name.startswith(f'{CORPUS}/schema-twins/')
+                      data = tar.extractfile(member).read()
+                      target = harness / member.name.removeprefix('packages/core-internal/')
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      target.write_bytes(data)
+                      records[member.name] = {'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
+              assert records[TEST]['sha256'] == os.environ['EXPECTED_TEST_SHA256'], records[TEST]
+              lock = git('show', f'{sha}:pnpm-lock.yaml').decode()
+              package = {'name': 'schema-twin-windows-check', 'private': True, 'type': 'module',
+                         'packageManager': 'pnpm@10.26.1', 'devDependencies': VERSIONS}
+              (harness / 'package.json').write_text(json.dumps(package, indent=2) + '\n', encoding='utf-8')
+              (harness / 'pnpm-lock.yaml').write_text(isolated_lock(lock), encoding='utf-8', newline='\n')
+              proof = {'result': 'PENDING', 'source_commit': sha, 'test': records[TEST],
+                       'source_lock_sha256': hashlib.sha256(lock.encode()).hexdigest(), 'dependencies': VERSIONS,
+                       'files': records, 'scope': 'Complete unchanged schemaTwinConformance.test.ts and exact corpus in an isolated harness; not the SDK suite or its workspace configuration.'}
+              (evidence / 'full-test-source.json').write_text(json.dumps(proof, indent=2) + '\n', encoding='utf-8')
+              for name in ['package.json', 'pnpm-lock.yaml']:
+                  (evidence / name).write_bytes((harness / name).read_bytes())
+              print(json.dumps({key: value for key, value in proof.items() if key != 'files'}, indent=2))
+              print(f'Materialized {len(records)} exact Git blobs; no test or fixture rewriting.')
+          
+          
+          if __name__ == '__main__':
+              main()
+      - name: Run complete schema-twin file on Windows
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $harness = Join-Path $env:RUNNER_TEMP 'schema-twin-full-test'
+          $evidence = Join-Path $env:RUNNER_TEMP 'schema-twin-evidence'
+          @("Node=$(node --version)", "pnpm=$(pnpm --version)") | Tee-Object -FilePath (Join-Path $evidence 'test-environment.log')
+          pnpm --dir $harness install --frozen-lockfile --ignore-scripts --store-dir (Join-Path $env:RUNNER_TEMP 'schema-twin-pnpm-store') 2>&1 | Tee-Object -FilePath (Join-Path $evidence 'test-install.log')
+          if ($LASTEXITCODE -ne 0) { throw 'Locked dependency installation failed' }
+          pnpm --dir $harness exec vitest run test/wire/schemaTwinConformance.test.ts --maxWorkers=1 --fileParallelism=false --reporter=default --reporter=json "--outputFile.json=$(Join-Path $evidence 'vitest-results.json')" 2>&1 | Tee-Object -FilePath (Join-Path $evidence 'vitest.log')
+          if ($LASTEXITCODE -ne 0) { throw 'Full schema-twin test file failed' }
+      - name: Verify complete-file report
+        shell: python
+        run: |
+          import json
+          import os
+          from pathlib import Path
+          assert os.name == 'nt', 'Native Windows is required'
+          evidence = Path(os.environ['RUNNER_TEMP']) / 'schema-twin-evidence'
+          report = json.loads((evidence / 'vitest-results.json').read_text(encoding='utf-8'))
+          assert report['success'] is True and report['numTotalTests'] == 180
+          assert report['numPassedTests'] == 180 and report['numFailedTests'] == 0 and report['numPendingTests'] == 0
+          assert len(report['testResults']) == 1 and len(report['testResults'][0]['assertionResults']) == 180
+          proof = json.loads((evidence / 'full-test-source.json').read_text(encoding='utf-8'))
+          proof.update(result='PASS', native_windows=True, tests_passed=180, tests_failed=0)
+          (evidence / 'full-test-source.json').write_text(json.dumps(proof, indent=2) + '\n', encoding='utf-8')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as output:
+              output.write(f"\nComplete unchanged schemaTwinConformance.test.ts: 180/180 passed on native Windows. Source: `{proof['source_commit']}`. Test SHA256: `{proof['test']['sha256']}`. Isolated fixture harness with source-locked dependencies, not the full SDK suite.\n")
+          print('PASS: complete unchanged schemaTwinConformance.test.ts, 180/180 tests on native Windows')
       - name: Upload real verification evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
