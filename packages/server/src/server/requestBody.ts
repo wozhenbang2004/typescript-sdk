@@ -28,12 +28,15 @@ export function resolveMaxRequestBodySize(value: number | undefined): number {
  * Reads a request body as text, up to `maxBytes` (default
  * {@linkcode DEFAULT_MAX_REQUEST_BODY_SIZE}). A declared `Content-Length` over the
  * limit is refused without reading anything; otherwise the read stops as soon as
- * more than the limit has arrived. Stream failures propagate.
+ * more than the limit has arrived. Stream failures propagate. An optional signal
+ * cancels a pending read and rejects with its abort reason without waiting for cancellation.
  */
 export async function readRequestBody(
     request: Request,
-    maxBytes: number = DEFAULT_MAX_REQUEST_BODY_SIZE
+    maxBytes: number = DEFAULT_MAX_REQUEST_BODY_SIZE,
+    signal?: AbortSignal
 ): Promise<{ tooLarge: true } | { tooLarge: false; text: string }> {
+    signal?.throwIfAborted();
     if (Number(request.headers.get('content-length')) > maxBytes) {
         return { tooLarge: true };
     }
@@ -41,12 +44,17 @@ export async function readRequestBody(
         return { tooLarge: false, text: '' };
     }
     const reader = request.body.getReader();
+    const onAbort = () => {
+        void reader.cancel(signal?.reason).catch(() => {});
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
     const decoder = new TextDecoder();
     let received = 0;
     let text = '';
     try {
         for (;;) {
             const { done, value } = await reader.read();
+            signal?.throwIfAborted();
             if (done) {
                 break;
             }
@@ -57,6 +65,7 @@ export async function readRequestBody(
             text += decoder.decode(value, { stream: true });
         }
     } finally {
+        signal?.removeEventListener('abort', onAbort);
         reader.releaseLock();
     }
     return { tooLarge: false, text: text + decoder.decode() };
