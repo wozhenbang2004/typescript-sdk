@@ -50,6 +50,13 @@ export interface CreateMcpHonoAppOptions {
      * @default 4194304 (4 MiB)
      */
     maxRequestBodySize?: number;
+
+    /**
+     * Maximum time, in milliseconds, for reading a JSON request body.
+     * Must be an integer between 1 and 2147483647. When omitted, only the
+     * underlying HTTP server timeout applies. Expiry returns HTTP 408.
+     */
+    bodyTimeoutMs?: number;
 }
 
 /**
@@ -57,8 +64,12 @@ export interface CreateMcpHonoAppOptions {
  * clone of the request, so the original stream stays readable. Returning only the
  * parsed value keeps the decoded text from outliving the parse.
  */
-async function parseJsonBody(request: Request, maxBytes: number): Promise<{ tooLarge: true } | { tooLarge: false; value: unknown }> {
-    const body = await readRequestBody(request, maxBytes);
+async function parseJsonBody(
+    request: Request,
+    maxBytes: number,
+    signal?: AbortSignal
+): Promise<{ tooLarge: true } | { tooLarge: false; value: unknown }> {
+    const body = await readRequestBody(request, maxBytes, signal);
     if (body.tooLarge) {
         return { tooLarge: true };
     }
@@ -76,15 +87,20 @@ async function parseJsonBody(request: Request, maxBytes: number): Promise<{ tooL
  * that stashes the parsed body into `c.set('parsedBody', ...)` when the `Content-Type`
  * media type is `application/json`. It runs after the Host/Origin validation, and JSON
  * bodies over `maxRequestBodySize` (4 MiB by default) are answered `413` before being parsed.
+ * When `bodyTimeoutMs` is provided, a stalled JSON body is answered `408` and cancelled.
  *
  * @param options - Configuration options
  * @returns A configured Hono application
  */
 export function createMcpHonoApp(options: CreateMcpHonoAppOptions = {}): Hono {
-    const { host = '127.0.0.1', allowedHosts, allowedOrigins } = options;
+    const { host = '127.0.0.1', allowedHosts, allowedOrigins, bodyTimeoutMs } = options;
     const maxRequestBodySize = options.maxRequestBodySize ?? DEFAULT_MAX_REQUEST_BODY_SIZE;
     if (typeof maxRequestBodySize !== 'number' || !Number.isFinite(maxRequestBodySize) || maxRequestBodySize <= 0) {
         throw new RangeError(`maxRequestBodySize must be a positive number of bytes, got ${String(maxRequestBodySize)}`);
+    }
+
+    if (bodyTimeoutMs !== undefined && (!Number.isInteger(bodyTimeoutMs) || bodyTimeoutMs < 1 || bodyTimeoutMs > 2_147_483_647)) {
+        throw new RangeError(`bodyTimeoutMs must be an integer between 1 and 2147483647, got ${String(bodyTimeoutMs)}`);
     }
 
     const app = new Hono();
@@ -132,9 +148,14 @@ export function createMcpHonoApp(options: CreateMcpHonoAppOptions = {}): Hono {
             return await next();
         }
 
+        const controller = bodyTimeoutMs === undefined ? undefined : new AbortController();
+        const timeout =
+            controller === undefined
+                ? undefined
+                : setTimeout(() => controller.abort(new DOMException('Request body timed out', 'TimeoutError')), bodyTimeoutMs);
         try {
             // Parse from a clone so we don't consume the original request stream.
-            const parsed = await parseJsonBody(c.req.raw.clone(), maxRequestBodySize);
+            const parsed = await parseJsonBody(c.req.raw.clone(), maxRequestBodySize, controller?.signal);
             if (parsed.tooLarge) {
                 return c.json(
                     {
@@ -147,8 +168,16 @@ export function createMcpHonoApp(options: CreateMcpHonoAppOptions = {}): Hono {
             }
             c.set('parsedBody', parsed.value);
         } catch {
+            if (controller?.signal.aborted) {
+                // Cancel the original tee branch too, without waiting for the client.
+                void c.req.raw.body?.cancel(controller.signal.reason).catch(() => {});
+                c.header('Connection', 'close');
+                return c.text('Request Timeout', 408);
+            }
             // Mirror express.json() behavior loosely: reject invalid JSON.
             return c.text('Invalid JSON', 400);
+        } finally {
+            clearTimeout(timeout);
         }
 
         return await next();
