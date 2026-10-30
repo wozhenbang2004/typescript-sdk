@@ -219,4 +219,74 @@ describe('@modelcontextprotocol/hono', () => {
 
         expect(() => createMcpHonoApp({ maxRequestBodySize: 0 })).toThrow(RangeError);
     });
+
+    test.each([false, true])('bodyTimeoutMs answers 408 for a stalled body (partial: %s)', async partial => {
+        const app = createMcpHonoApp({ bodyTimeoutMs: 20 });
+        const route = vi.fn((c: Context) => c.text('unexpected'));
+        app.post('/echo', route);
+        const cancel = vi.fn(() => new Promise<void>(() => {}));
+        const body = new ReadableStream<Uint8Array>({
+            start(controller) {
+                if (partial) controller.enqueue(new TextEncoder().encode('{'));
+            },
+            cancel
+        });
+        const res = await app.request('http://localhost/echo', {
+            method: 'POST',
+            headers: { ...jsonHeaders, 'content-length': '100' },
+            body,
+            duplex: 'half'
+        } as RequestInit);
+
+        expect(res.status).toBe(408);
+        expect(await res.text()).toBe('Request Timeout');
+        expect(res.headers.get('connection')).toBe('close');
+        expect(route).not.toHaveBeenCalled();
+        await vi.waitFor(() => expect(cancel).toHaveBeenCalledOnce());
+    });
+
+    test.each([
+        { body: '{}', status: 200 },
+        { body: '{', status: 400 },
+        { body: '{"a":true}', status: 413 }
+    ])('clears the body deadline after a $status response', async ({ body, status }) => {
+        const abort = vi.spyOn(AbortController.prototype, 'abort');
+        try {
+            const app = createMcpHonoApp({ bodyTimeoutMs: 100, maxRequestBodySize: 4 });
+            app.post('/echo', async c => {
+                await new Promise(resolve => setTimeout(resolve, 150));
+                expect(await c.req.raw.text()).toBe(body);
+                return c.json(c.get('parsedBody'));
+            });
+            const res = await app.request('http://localhost/echo', { method: 'POST', headers: jsonHeaders, body });
+            expect(res.status).toBe(status);
+            await new Promise(resolve => setTimeout(resolve, 150));
+            expect(abort).not.toHaveBeenCalled();
+        } finally {
+            abort.mockRestore();
+        }
+    });
+
+    test('does not impose a body deadline when bodyTimeoutMs is omitted', async () => {
+        const app = createMcpHonoApp();
+        app.post('/echo', c => c.json(c.get('parsedBody')));
+        const body = new ReadableStream<Uint8Array>({
+            start(controller) {
+                setTimeout(() => {
+                    controller.enqueue(new TextEncoder().encode('{"ok":true}'));
+                    controller.close();
+                }, 30);
+            }
+        });
+        const res = await app.request('http://localhost/echo', {
+            method: 'POST', headers: jsonHeaders, body, duplex: 'half'
+        } as RequestInit);
+        expect(res.status).toBe(200);
+        expect(await res.json()).toEqual({ ok: true });
+    });
+
+    test.each([0, -1, 0.5, NaN, Infinity, 2_147_483_648])('rejects invalid bodyTimeoutMs %s', bodyTimeoutMs => {
+        expect(() => createMcpHonoApp({ bodyTimeoutMs })).toThrow(RangeError);
+    });
+
 });
