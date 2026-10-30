@@ -255,7 +255,7 @@ describe('@modelcontextprotocol/hono', () => {
         const abort = vi.spyOn(AbortController.prototype, 'abort');
         try {
             const app = createMcpHonoApp({ bodyTimeoutMs: 100, maxRequestBodySize: 4 });
-            app.post('/echo', async c => {
+            app.post('/echo', async (c: Context) => {
                 await new Promise(resolve => setTimeout(resolve, 150));
                 expect(await c.req.raw.text()).toBe(body);
                 return c.json(c.get('parsedBody'));
@@ -271,7 +271,7 @@ describe('@modelcontextprotocol/hono', () => {
 
     test('does not impose a body deadline when bodyTimeoutMs is omitted', async () => {
         const app = createMcpHonoApp();
-        app.post('/echo', c => c.json(c.get('parsedBody')));
+        app.post('/echo', (c: Context) => c.json(c.get('parsedBody')));
         const body = new ReadableStream<Uint8Array>({
             start(controller) {
                 setTimeout(() => {
