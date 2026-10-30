@@ -227,7 +227,9 @@ describe('@modelcontextprotocol/hono', () => {
         const cancel = vi.fn(() => new Promise<void>(() => {}));
         const body = new ReadableStream<Uint8Array>({
             start(controller) {
-                if (partial) controller.enqueue(new TextEncoder().encode('{'));
+                if (partial) {
+                    controller.enqueue(new TextEncoder().encode('{'));
+                }
             },
             cancel
         });
@@ -279,7 +281,10 @@ describe('@modelcontextprotocol/hono', () => {
             }
         });
         const res = await app.request('http://localhost/echo', {
-            method: 'POST', headers: jsonHeaders, body, duplex: 'half'
+            method: 'POST',
+            headers: jsonHeaders,
+            body,
+            duplex: 'half'
         } as RequestInit);
         expect(res.status).toBe(200);
         expect(await res.json()).toEqual({ ok: true });
@@ -288,5 +293,4 @@ describe('@modelcontextprotocol/hono', () => {
     test.each([0, -1, 0.5, NaN, Infinity, 2_147_483_648])('rejects invalid bodyTimeoutMs %s', bodyTimeoutMs => {
         expect(() => createMcpHonoApp({ bodyTimeoutMs })).toThrow(RangeError);
     });
-
 });
