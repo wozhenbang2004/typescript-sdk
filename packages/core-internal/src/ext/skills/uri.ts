@@ -45,7 +45,8 @@ const MANIFEST_SUFFIX = '/SKILL.md';
 /** The skill's root directory URI (no trailing slash), or `undefined` if `skillMdUri` is not a `…/SKILL.md` URI in a named directory. */
 export function skillRootUri(skillMdUri: string): string | undefined {
     const canonical = canonicalUri(skillMdUri);
-    if (canonical === undefined || !canonical.endsWith(MANIFEST_SUFFIX)) return undefined;
+    // A suffix in the query or fragment does not name the manifest.
+    if (canonical === undefined || /[#?]/.test(canonical) || !canonical.endsWith(MANIFEST_SUFFIX)) return undefined;
     const root = canonical.slice(0, -MANIFEST_SUFFIX.length);
     // `scheme:/` or `scheme://` (no directory) and `…//SKILL.md` (an empty last segment) name no directory.
     return root.endsWith('/') ? undefined : root;
