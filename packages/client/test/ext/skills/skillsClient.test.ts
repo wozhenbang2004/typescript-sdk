@@ -84,6 +84,23 @@ describe('SkillsClient.list', () => {
         ]);
     });
 
+    it('rejects skill URIs that only end in /SKILL.md in the query or fragment', async () => {
+        const frontmatter = { name: 'refunds', description: 'Refund requests' };
+        const manifest: Skill = { uri: 'skill://refunds/SKILL.md', frontmatter, resources: 'dynamic' };
+        const query = { ...manifest, uri: 'skill://refunds?view=/SKILL.md' };
+        const fragment = { ...manifest, uri: 'skill://refunds#/SKILL.md' };
+        const { client } = await scriptedClient(CAPABILITIES, {
+            'skills/list': () => ({ skills: [manifest, query, fragment], ...CACHE })
+        });
+
+        const { skills, invalid } = await new SkillsClient(client, { skipInvalid: true }).list();
+        expect(skills).toEqual([manifest]);
+        expect(invalid).toEqual([
+            { index: 1, uri: query.uri, reason: expect.stringContaining('/SKILL.md') },
+            { index: 2, uri: fragment.uri, reason: expect.stringContaining('/SKILL.md') }
+        ]);
+    });
+
     it('throws on any invalid entry by default, naming every one', async () => {
         const [alpha, beta] = await threeSkills();
         const { client } = await scriptedClient(CAPABILITIES, { 'skills/list': () => ({ skills: [alpha, alpha, beta], ...CACHE }) });
